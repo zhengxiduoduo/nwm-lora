@@ -18,7 +18,13 @@ from diffusers.models import AutoencoderKL
 
 import misc
 import distributed as dist
-from models import CDiT_models
+from models import (
+    CDiT_models,
+    apply_lora,
+    is_lora_enabled,
+    load_lora_compatible_state_dict,
+    normalize_lora_config,
+)
 from datasets import EvalDataset
 from PIL import Image
 
@@ -125,7 +131,7 @@ def visualize_preds(output_dir, idxs, sec, x_pred_pixels):
 
 @torch.no_grad
 def main(args):
-    _, _, device, _ = init_distributed()
+    _, _, device, _ = dist.init_distributed()
     print(args)
     device = torch.device(device)
     num_tasks = dist.get_world_size()
@@ -161,7 +167,14 @@ def main(args):
     if not args.gt:
         model = CDiT_models[config['model']](context_size=num_cond, input_size=latent_size, in_channels=4)
         ckp = torch.load(f'{config["results_dir"]}/{config["run_name"]}/checkpoints/{args.ckp}.pth.tar', map_location='cpu', weights_only=False)
-        print(model.load_state_dict(ckp["ema"], strict=True))
+        lora_config = normalize_lora_config({"lora": ckp.get("lora_config", config.get("lora", {}))})
+        if is_lora_enabled(lora_config):
+            model = apply_lora(model, lora_config)
+            model_state = ckp["ema"] if "ema" in ckp else ckp["model"]
+            missing, unexpected = load_lora_compatible_state_dict(model, model_state, strict=True)
+            print("Loading LoRA EMA model weights", f"missing={len(missing)} unexpected={len(unexpected)}")
+        else:
+            print(model.load_state_dict(ckp["ema"], strict=True))
         model.eval()
         model.to(device)
         model = torch.compile(model)

@@ -33,7 +33,15 @@ from torch.utils.data.distributed import DistributedSampler
 from diffusers.models import AutoencoderKL
 
 from distributed import init_distributed
-from models import CDiT_models
+from models import (
+    CDiT_models,
+    apply_lora,
+    count_parameters,
+    is_lora_enabled,
+    load_lora_compatible_state_dict,
+    lora_state_dict,
+    normalize_lora_config,
+)
 from diffusion import create_diffusion
 from datasets import TrainingDataset
 from misc import transform
@@ -61,6 +69,10 @@ def requires_grad(model, flag=True):
     """
     for p in model.parameters():
         p.requires_grad = flag
+
+
+def optimizer_parameters(model):
+    return [p for p in model.parameters() if p.requires_grad]
 
 
 def cleanup():
@@ -129,13 +141,6 @@ def main(args):
     assert config['image_size'] % 8 == 0, "Image size must be divisible by 8 (for the VAE encoder)."
     num_cond = config['context_size']
     model = CDiT_models[config['model']](context_size=num_cond, input_size=latent_size, in_channels=4).to(device)
-    
-    ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training
-    requires_grad(ema, False)
-    
-    # Setup optimizer (we used default Adam betas=(0.9, 0.999) and a constant learning rate of 1e-4 in our paper):
-    lr = float(config.get('lr', 1e-4))
-    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0)
 
     bfloat_enable = bool(hasattr(args, 'bfloat16') and args.bfloat16)
     if bfloat_enable:
@@ -146,25 +151,69 @@ def main(args):
     print('Searching for model from ', checkpoint_dir)
     start_epoch = 0
     train_steps = 0
+    latest_checkpoint = None
     if os.path.isfile(latest_path) or config.get('from_checkpoint', 0):
         if os.path.isfile(latest_path) and config.get('from_checkpoint', 0):
             raise ValueError("Resuming from checkpoint, this might override latest.pth.tar!!")
         latest_path = latest_path if os.path.isfile(latest_path) else config.get('from_checkpoint', 0)
         print("Loading model from ", latest_path)
-        latest_checkpoint = torch.load(latest_path, map_location=device, weights_only=False) 
+        latest_checkpoint = torch.load(latest_path, map_location=device, weights_only=False)
 
+    lora_config = normalize_lora_config(config, args)
+    lora_cli_overrides = any(
+        getattr(args, attr, None) is not None
+        for attr in ("lora", "lora_rank", "lora_alpha", "lora_dropout", "lora_target_modules", "lora_train_bias")
+    )
+    if latest_checkpoint and latest_checkpoint.get("lora_config") and not lora_cli_overrides:
+        lora_config = normalize_lora_config({"lora": latest_checkpoint["lora_config"]})
+
+    if is_lora_enabled(lora_config):
+        model = apply_lora(model, lora_config)
+        logger.info(
+            "LoRA enabled: "
+            f"rank={lora_config['rank']}, alpha={lora_config['alpha']}, "
+            f"dropout={lora_config['dropout']}, targets={lora_config['target_modules']}"
+        )
+
+    ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training
+    requires_grad(ema, False)
+
+    if latest_checkpoint is not None:
         if "model" in latest_checkpoint:
-            model_ckp = {k.replace('_orig_mod.', ''):v for k,v in latest_checkpoint['model'].items()}
-            res = model.load_state_dict(model_ckp, strict=True)
-            print("Loading model weights", res)
+            model_ckp = latest_checkpoint["model"]
+            if is_lora_enabled(lora_config):
+                missing, unexpected = load_lora_compatible_state_dict(model, model_ckp, strict=True)
+                print("Loading model weights", f"missing={len(missing)} unexpected={len(unexpected)}")
+            else:
+                model_ckp = {k.replace('_orig_mod.', ''):v for k,v in model_ckp.items()}
+                res = model.load_state_dict(model_ckp, strict=True)
+                print("Loading model weights", res)
 
-            model_ckp = {k.replace('_orig_mod.', ''):v for k,v in latest_checkpoint['ema'].items()}
-            res = ema.load_state_dict(model_ckp, strict=True)
-            print("Loading EMA model weights", res)
+            if "ema" in latest_checkpoint:
+                model_ckp = latest_checkpoint["ema"]
+                if is_lora_enabled(lora_config):
+                    missing, unexpected = load_lora_compatible_state_dict(ema, model_ckp, strict=True)
+                    print("Loading EMA model weights", f"missing={len(missing)} unexpected={len(unexpected)}")
+                    if any("lora_" in key for key in missing):
+                        update_ema(ema, model, decay=0)
+                else:
+                    model_ckp = {k.replace('_orig_mod.', ''):v for k,v in model_ckp.items()}
+                    res = ema.load_state_dict(model_ckp, strict=True)
+                    print("Loading EMA model weights", res)
+            else:
+                update_ema(ema, model, decay=0)
         else:
             update_ema(ema, model, decay=0)  # Ensure EMA is initialized with synced weights
 
-        if "opt" in latest_checkpoint:
+    # Setup optimizer (we used default Adam betas=(0.9, 0.999) and a constant learning rate of 1e-4 in our paper):
+    lr = float(config.get('lr', 1e-4))
+    trainable_params = optimizer_parameters(model)
+    if len(trainable_params) == 0:
+        raise ValueError("No trainable parameters found. Check LoRA configuration.")
+    opt = torch.optim.AdamW(trainable_params, lr=lr, weight_decay=0)
+
+    if latest_checkpoint is not None:
+        if "opt" in latest_checkpoint and not (is_lora_enabled(lora_config) and "lora_config" not in latest_checkpoint):
             opt_ckp = {k.replace('_orig_mod.', ''):v for k,v in latest_checkpoint['opt'].items()}
             opt.load_state_dict(opt_ckp)
             print("Loading optimizer params")
@@ -175,7 +224,7 @@ def main(args):
         if "train_steps" in latest_checkpoint:
             train_steps = latest_checkpoint["train_steps"]
         
-        if "scaler" in latest_checkpoint:
+        if bfloat_enable and "scaler" in latest_checkpoint:
             scaler.load_state_dict(latest_checkpoint["scaler"])
         
     # ~40% speedup but might leads to worse performance depending on pytorch version
@@ -183,7 +232,10 @@ def main(args):
         model = torch.compile(model)
     model = DDP(model, device_ids=[device])
     diffusion = create_diffusion(timestep_respacing="")  # default: 1000 steps, linear noise schedule
-    logger.info(f"CDiT Parameters: {sum(p.numel() for p in model.parameters()):,}")
+    logger.info(
+        f"CDiT Parameters: {count_parameters(model):,}; "
+        f"Trainable Parameters: {count_parameters(model, trainable_only=True):,}"
+    )
 
     train_dataset = []
     test_dataset = []
@@ -300,7 +352,7 @@ def main(args):
                 scaler.scale(loss).backward()
                 if config.get('grad_clip_val', 0) > 0:
                     scaler.unscale_(opt)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config['grad_clip_val'])
+                    torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=config['grad_clip_val'])
                 scaler.step(opt)
                 scaler.update()
             
@@ -337,6 +389,12 @@ def main(args):
                         "epoch": epoch,
                         "train_steps": train_steps
                     }
+                    if is_lora_enabled(lora_config):
+                        checkpoint.update({
+                            "lora": lora_state_dict(model.module),
+                            "lora_ema": lora_state_dict(ema),
+                            "lora_config": lora_config,
+                        })
                     if bfloat_enable:
                         checkpoint.update({"scaler": scaler.state_dict()})
                     checkpoint_path = f"{checkpoint_dir}/latest.pth.tar"
@@ -430,6 +488,12 @@ def get_args_parser():
     parser.add_argument("--eval-every", type=int, default=5000)
     parser.add_argument("--bfloat16", type=int, default=1)
     parser.add_argument("--torch-compile", type=int, default=1)
+    parser.add_argument("--lora", type=int, default=None, help="set to 1 to enable LoRA, 0 to disable; overrides config.lora.enabled")
+    parser.add_argument("--lora-rank", type=int, default=None, help="LoRA rank")
+    parser.add_argument("--lora-alpha", type=float, default=None, help="LoRA scaling alpha")
+    parser.add_argument("--lora-dropout", type=float, default=None, help="LoRA dropout for linear layers")
+    parser.add_argument("--lora-target-modules", type=str, default=None, help="comma-separated module name patterns to wrap with LoRA")
+    parser.add_argument("--lora-train-bias", type=str, default=None, choices=["none", "all", "lora_only"], help="bias training mode for LoRA")
     return parser
 
 if __name__ == "__main__":

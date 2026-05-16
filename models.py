@@ -8,8 +8,10 @@
 # GLIDE: https://github.com/openai/glide-text2im
 # MAE: https://github.com/facebookresearch/mae/blob/main/models_mae.py
 # --------------------------------------------------------
+import fnmatch
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 import math
 from timm.models.vision_transformer import PatchEmbed, Attention, Mlp
@@ -17,6 +19,325 @@ from timm.models.vision_transformer import PatchEmbed, Attention, Mlp
 
 def modulate(x, shift, scale):
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+
+
+#################################################################################
+#                              LoRA Utilities                                    #
+#################################################################################
+
+DEFAULT_LORA_TARGET_MODULES = (
+    "blocks.*.attn.qkv",
+    "blocks.*.attn.proj",
+    "blocks.*.cttn",
+    "blocks.*.mlp.fc1",
+    "blocks.*.mlp.fc2",
+    "blocks.*.adaLN_modulation.1",
+    "final_layer.linear",
+    "final_layer.adaLN_modulation.1",
+)
+
+
+class LoRALinear(nn.Module):
+    """
+    A drop-in LoRA wrapper for nn.Linear.
+    The wrapped base layer is frozen; only lora_A/lora_B are trainable.
+    """
+    def __init__(self, base_layer, rank=8, alpha=16, dropout=0.0):
+        super().__init__()
+        if not isinstance(base_layer, nn.Linear):
+            raise TypeError("LoRALinear expects an nn.Linear base layer.")
+        if rank <= 0:
+            raise ValueError("LoRA rank must be positive.")
+
+        self.base_layer = base_layer
+        self.rank = int(rank)
+        self.alpha = float(alpha)
+        self.scaling = self.alpha / self.rank
+        self.lora_dropout = nn.Dropout(p=float(dropout)) if dropout > 0 else nn.Identity()
+
+        self.lora_A = nn.Parameter(torch.empty(self.rank, base_layer.in_features))
+        self.lora_B = nn.Parameter(torch.empty(base_layer.out_features, self.rank))
+        self.reset_lora_parameters()
+
+        for param in self.base_layer.parameters():
+            param.requires_grad = False
+
+    @property
+    def weight(self):
+        return self.base_layer.weight
+
+    @property
+    def bias(self):
+        return self.base_layer.bias
+
+    def reset_lora_parameters(self):
+        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+        nn.init.zeros_(self.lora_B)
+
+    def forward(self, x):
+        result = self.base_layer(x)
+        lora_x = self.lora_dropout(x).to(self.lora_A.dtype)
+        update = F.linear(F.linear(lora_x, self.lora_A), self.lora_B) * self.scaling
+        return result + update.to(result.dtype)
+
+
+class LoRAMultiheadAttention(nn.Module):
+    """
+    LoRA wrapper for nn.MultiheadAttention.
+    It keeps the original MHA weights frozen and injects low-rank updates into
+    q/k/v and output projection weights at forward time.
+    """
+    def __init__(self, base_layer, rank=8, alpha=16):
+        super().__init__()
+        if not isinstance(base_layer, nn.MultiheadAttention):
+            raise TypeError("LoRAMultiheadAttention expects an nn.MultiheadAttention base layer.")
+        if not base_layer._qkv_same_embed_dim:
+            raise ValueError("LoRA MHA wrapper only supports q/k/v with the same embed dim.")
+        if rank <= 0:
+            raise ValueError("LoRA rank must be positive.")
+
+        self.base_layer = base_layer
+        self.rank = int(rank)
+        self.alpha = float(alpha)
+        self.scaling = self.alpha / self.rank
+        embed_dim = base_layer.embed_dim
+
+        for name in ("q", "k", "v", "out"):
+            setattr(self, f"lora_A_{name}", nn.Parameter(torch.empty(self.rank, embed_dim)))
+            setattr(self, f"lora_B_{name}", nn.Parameter(torch.empty(embed_dim, self.rank)))
+
+        self.reset_lora_parameters()
+        for param in self.base_layer.parameters():
+            param.requires_grad = False
+
+    def reset_lora_parameters(self):
+        for name in ("q", "k", "v", "out"):
+            nn.init.kaiming_uniform_(getattr(self, f"lora_A_{name}"), a=math.sqrt(5))
+            nn.init.zeros_(getattr(self, f"lora_B_{name}"))
+
+    def _delta(self, name, dtype):
+        lora_A = getattr(self, f"lora_A_{name}")
+        lora_B = getattr(self, f"lora_B_{name}")
+        return (lora_B @ lora_A * self.scaling).to(dtype)
+
+    def forward(
+        self,
+        query,
+        key,
+        value,
+        key_padding_mask=None,
+        need_weights=True,
+        attn_mask=None,
+        average_attn_weights=True,
+        is_causal=False,
+    ):
+        is_batched = query.dim() == 3
+        if self.base_layer.batch_first and is_batched:
+            query = query.transpose(0, 1)
+            key = key.transpose(0, 1)
+            value = value.transpose(0, 1)
+
+        base = self.base_layer
+        in_proj_delta = torch.cat(
+            [
+                self._delta("q", base.in_proj_weight.dtype),
+                self._delta("k", base.in_proj_weight.dtype),
+                self._delta("v", base.in_proj_weight.dtype),
+            ],
+            dim=0,
+        )
+        in_proj_weight = base.in_proj_weight + in_proj_delta
+        out_proj_weight = base.out_proj.weight + self._delta("out", base.out_proj.weight.dtype)
+
+        attn_output, attn_output_weights = F.multi_head_attention_forward(
+            query=query,
+            key=key,
+            value=value,
+            embed_dim_to_check=base.embed_dim,
+            num_heads=base.num_heads,
+            in_proj_weight=in_proj_weight,
+            in_proj_bias=base.in_proj_bias,
+            bias_k=base.bias_k,
+            bias_v=base.bias_v,
+            add_zero_attn=base.add_zero_attn,
+            dropout_p=base.dropout,
+            out_proj_weight=out_proj_weight,
+            out_proj_bias=base.out_proj.bias,
+            training=base.training,
+            key_padding_mask=key_padding_mask,
+            need_weights=need_weights,
+            attn_mask=attn_mask,
+            average_attn_weights=average_attn_weights,
+            is_causal=is_causal,
+        )
+
+        if self.base_layer.batch_first and is_batched:
+            attn_output = attn_output.transpose(0, 1)
+        return attn_output, attn_output_weights
+
+
+def _as_bool(value):
+    if isinstance(value, str):
+        return value.lower() in {"1", "true", "yes", "y", "on"}
+    return bool(value)
+
+
+def _split_target_modules(value):
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return [item.strip() for item in value.split(",") if item.strip()]
+    return list(value)
+
+
+def normalize_lora_config(config=None, args=None):
+    config = config or {}
+    raw_lora = config.get("lora", {})
+    if isinstance(raw_lora, bool):
+        raw_lora = {"enabled": raw_lora}
+    lora_config = {
+        "enabled": _as_bool(raw_lora.get("enabled", False)),
+        "rank": int(raw_lora.get("rank", raw_lora.get("r", 8))),
+        "alpha": float(raw_lora.get("alpha", 16)),
+        "dropout": float(raw_lora.get("dropout", 0.0)),
+        "target_modules": _split_target_modules(raw_lora.get("target_modules", DEFAULT_LORA_TARGET_MODULES)),
+        "train_bias": raw_lora.get("train_bias", "none"),
+    }
+
+    if args is not None:
+        if getattr(args, "lora", None) is not None:
+            lora_config["enabled"] = _as_bool(args.lora)
+        if getattr(args, "lora_rank", None) is not None:
+            lora_config["rank"] = int(args.lora_rank)
+        if getattr(args, "lora_alpha", None) is not None:
+            lora_config["alpha"] = float(args.lora_alpha)
+        if getattr(args, "lora_dropout", None) is not None:
+            lora_config["dropout"] = float(args.lora_dropout)
+        if getattr(args, "lora_target_modules", None):
+            lora_config["target_modules"] = _split_target_modules(args.lora_target_modules)
+        if getattr(args, "lora_train_bias", None):
+            lora_config["train_bias"] = args.lora_train_bias
+
+    return lora_config
+
+
+def is_lora_enabled(lora_config):
+    return bool(lora_config and _as_bool(lora_config.get("enabled", False)))
+
+
+def _matches_lora_target(module_name, target_modules):
+    return any(
+        fnmatch.fnmatch(module_name, target)
+        or module_name.endswith(target)
+        or module_name == target
+        for target in target_modules
+    )
+
+
+def apply_lora(model, lora_config):
+    if not is_lora_enabled(lora_config):
+        return model
+
+    target_modules = lora_config.get("target_modules") or DEFAULT_LORA_TARGET_MODULES
+    rank = int(lora_config.get("rank", 8))
+    alpha = float(lora_config.get("alpha", 16))
+    dropout = float(lora_config.get("dropout", 0.0))
+
+    def _replace(module, prefix=""):
+        for child_name, child in list(module.named_children()):
+            full_name = f"{prefix}.{child_name}" if prefix else child_name
+            if isinstance(child, (LoRALinear, LoRAMultiheadAttention)):
+                continue
+            if isinstance(child, nn.MultiheadAttention) and _matches_lora_target(full_name, target_modules):
+                setattr(module, child_name, LoRAMultiheadAttention(child, rank=rank, alpha=alpha))
+                continue
+            if isinstance(child, nn.Linear) and _matches_lora_target(full_name, target_modules):
+                setattr(module, child_name, LoRALinear(child, rank=rank, alpha=alpha, dropout=dropout))
+                continue
+            _replace(child, full_name)
+
+    _replace(model)
+    mark_only_lora_as_trainable(model, train_bias=lora_config.get("train_bias", "none"))
+    return model
+
+
+def mark_only_lora_as_trainable(model, train_bias="none"):
+    for name, param in model.named_parameters():
+        param.requires_grad = "lora_" in name
+
+    if train_bias == "all":
+        for name, param in model.named_parameters():
+            if name.endswith(".bias"):
+                param.requires_grad = True
+    elif train_bias == "lora_only":
+        for module in model.modules():
+            if isinstance(module, LoRALinear) and module.base_layer.bias is not None:
+                module.base_layer.bias.requires_grad = True
+            elif isinstance(module, LoRAMultiheadAttention):
+                if module.base_layer.in_proj_bias is not None:
+                    module.base_layer.in_proj_bias.requires_grad = True
+                if module.base_layer.out_proj.bias is not None:
+                    module.base_layer.out_proj.bias.requires_grad = True
+    elif train_bias != "none":
+        raise ValueError("train_bias must be one of: 'none', 'all', 'lora_only'.")
+
+
+def lora_state_dict(model):
+    return {k: v for k, v in model.state_dict().items() if "lora_" in k}
+
+
+def count_parameters(model, trainable_only=False):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad or not trainable_only)
+
+
+def _clean_state_key(key):
+    key = key.replace("_orig_mod.", "")
+    if key.startswith("module."):
+        key = key[len("module."):]
+    return key
+
+
+def _find_base_layer_key(key, model_keys):
+    parts = key.split(".")
+    for insert_idx in range(len(parts), 0, -1):
+        candidate = ".".join(parts[:insert_idx] + ["base_layer"] + parts[insert_idx:])
+        if candidate in model_keys:
+            return candidate
+    return None
+
+
+def load_lora_compatible_state_dict(model, state_dict, strict=True):
+    model_state = model.state_dict()
+    model_keys = set(model_state.keys())
+    remapped_state = {}
+    dropped_keys = []
+
+    for key, value in state_dict.items():
+        clean_key = _clean_state_key(key)
+        if clean_key in model_keys:
+            remapped_state[clean_key] = value
+            continue
+
+        base_layer_key = _find_base_layer_key(clean_key, model_keys)
+        if base_layer_key is not None:
+            remapped_state[base_layer_key] = value
+            continue
+
+        dropped_keys.append(clean_key)
+
+    incompatible = model.load_state_dict(remapped_state, strict=False)
+    missing_keys = list(incompatible.missing_keys)
+    unexpected_keys = list(incompatible.unexpected_keys) + dropped_keys
+
+    if strict:
+        real_missing = [key for key in missing_keys if "lora_" not in key]
+        if real_missing or unexpected_keys:
+            raise RuntimeError(
+                "Error(s) in loading state_dict with LoRA compatibility:\n"
+                f"Missing keys: {real_missing}\n"
+                f"Unexpected keys: {unexpected_keys}"
+            )
+    return missing_keys, unexpected_keys
 
 
 #################################################################################

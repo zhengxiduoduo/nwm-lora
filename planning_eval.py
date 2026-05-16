@@ -31,7 +31,13 @@ from isolated_nwm_infer import model_forward_wrapper
 from misc import calculate_delta_yaw, get_action_torch, save_planning_pred, log_viz_single, transform, unnormalize_data
 from isolated_nwm_eval import save_metric_to_disk
 import distributed as dist
-from models import CDiT_models
+from models import (
+    CDiT_models,
+    apply_lora,
+    is_lora_enabled,
+    load_lora_compatible_state_dict,
+    normalize_lora_config,
+)
 
 
 with open("config/data_config.yaml", "r") as f:
@@ -189,7 +195,14 @@ class WM_Planning_Evaluator:
         )
 
         ckp = torch.load(f'{self.config["results_dir"]}/{self.config["run_name"]}/checkpoints/{args.ckp}.pth.tar', map_location='cpu', weights_only=False)
-        model.load_state_dict(ckp["ema"], strict=True)
+        lora_config = normalize_lora_config({"lora": ckp.get("lora_config", self.config.get("lora", {}))})
+        if is_lora_enabled(lora_config):
+            model = apply_lora(model, lora_config)
+            model_state = ckp["ema"] if "ema" in ckp else ckp["model"]
+            missing, unexpected = load_lora_compatible_state_dict(model, model_state, strict=True)
+            print("Loading LoRA EMA model weights", f"missing={len(missing)} unexpected={len(unexpected)}")
+        else:
+            model.load_state_dict(ckp["ema"], strict=True)
         model.eval()
         model.to(self.device)
         self.model = torch.compile(model)
